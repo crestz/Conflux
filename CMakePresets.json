@@ -1,0 +1,41 @@
+{
+  "version": 8,
+  "configurePresets": [
+    {
+      "name": "Base",
+      "displayName": "Base Configuration",
+      "description": "sets generator, build path and vcpkg toolchain file",
+      "generator": "Ninja",
+      "binaryDir": "./build/bin/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_CLANG_TIDY": "clang-tidy",
+        "CMAKE_CXX_CLANG_FORMAT": "clang-format",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      }
+    },
+    {
+      "name": "AsanUbsan",
+      "displayName": "ASan + UBSan",
+      "inherits": "Base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS_DEBUG": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS_DEBUG": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CONFLUX_BUILD_TESTS": "ON",
+        "CONFLUX_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "TSan",
+      "displayName": "TSan",
+      "inherits": "Base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-fsanitize=thread -fno-omit-frame-pointer -g -O2",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-fsanitize=thread -fno-omit-frame-pointer -g -O2",
+        "CONFLUX_BUILD_TESTS": "ON",
+        "CONFLUX_BUILD_BENCHMARKS": "OFF"
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# ninja log v7
+1	3489	1764055061209548628	Tests/CMakeFiles/Conflux_test.dir/HelloTest.cxx.o	f6c8ccfd94be6aa3
+1	3981	1764055061209307875	Source/CMakeFiles/Conflux.dir/memory/EBR.cxx.o	593c210ba7679873
+3981	4052	1764055065189619669	Source/libConflux.a	1f849c1b5b9b8c0
+1	5309	1764055061209684379	Tests/CMakeFiles/Conflux_test.dir/EbrTest.cxx.o	24024e24fe289c56
+5309	6513	1764055067721106416	Tests/Conflux_test	86a20f649e87c0ac
+5309	6513	1764055067721106416	Tests/Conflux_test[1]_tests.cmake	86a20f649e87c0ac
+5309	6513	1764055067721106416	/Users/prakharprabir/source/orgs/crestz/conflux/build/bin/AsanUbsan/Tests/Conflux_test[1]_tests.cmake	86a20f649e87c0ac

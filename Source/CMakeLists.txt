@@ -1,0 +1,43 @@
+find_package(gsl-lite CONFIG REQUIRED)
+
+add_library(${PROJECT_NAME}
+  "Common.hxx"
+  "memory/EBR.hxx"
+  "memory/EBR.cxx"
+  "memory/detail/CRQ.hxx"
+)
+
+add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
+
+target_sources(
+  ${PROJECT_NAME}
+  PUBLIC
+    FILE_SET HEADERS TYPE HEADERS
+    BASE_DIRS ${PROJECT_SOURCE_DIR}/include
+    FILES
+      ${PROJECT_SOURCE_DIR}/include/Conflux/Memory.hxx
+      ${PROJECT_SOURCE_DIR}/include/Conflux/Utils.hxx
+)
+
+target_include_directories(
+  ${PROJECT_NAME}
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_20)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE gsl-lite::gsl-lite)
+
+install(
+  TARGETS ${PROJECT_NAME}
+  EXPORT confluxTargets
+  FILE_SET HEADERS DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)

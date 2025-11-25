@@ -1,0 +1,89 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  misc-*,
+  performance-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  readability-identifier-naming,
+  clang-analyzer-*,
+  -clang-analyzer-alpha.*,
+  -misc-const-correctness,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-union-access
+
+# Be strict about real bugs / perf footguns, but don’t block on every style nit.
+WarningsAsErrors: 'bugprone-*,performance-*'
+
+CheckOptions:
+  # ---------------------------------------------------------------------------
+  # Padding / False-sharing-ish heuristic
+  # ---------------------------------------------------------------------------
+  # Warn if the analyzer sees more than 16 bytes of padding in a struct.
+  # (You can tune this up/down as you see how noisy it is.)
+  - key:             clang-analyzer-optin.performance.Padding.AllowedPad
+    value:           '16'
+
+  # ---------------------------------------------------------------------------
+  # Naming rules
+  # ---------------------------------------------------------------------------
+
+  # Types -> CamelCase
+  - key:             readability-identifier-naming.ClassCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.StructCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.EnumCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TypedefCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.UnionCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TypeTemplateParameterCase
+    value:           CamelCase
+
+  # Functions / methods -> lower_case
+  - key:             readability-identifier-naming.FunctionCase
+    value:           lower_case
+  - key:             readability-identifier-naming.MethodCase
+    value:           lower_case
+  - key:             readability-identifier-naming.ConstexprFunctionCase
+    value:           lower_case
+
+  # Variables -> lower_case
+  - key:             readability-identifier-naming.VariableCase
+    value:           lower_case
+  - key:             readability-identifier-naming.ParameterCase
+    value:           lower_case
+  - key:             readability-identifier-naming.MemberCase
+    value:           lower_case
+
+  # Allow lower_snake_case for local constants (we keep cache-line constants UPPER_CASE).
+  - key:             readability-identifier-naming.LocalConstantCase
+    value:           lower_case
+
+  # Make members visually distinct (optional but handy in lock-free code)
+  - key:             readability-identifier-naming.MemberSuffix
+    value:           _
+
+   # Make global variable visually distinct (optional but handy in lock-free code)
+  - key:             readability-identifier-naming.GlobalVariablePrefix
+    value:           g_
+
+  # Constants -> UPPER_CASE (for cache line sizes, masks, etc.)
+  - key:             readability-identifier-naming.ConstantCase
+    value:           UPPER_CASE
+
+  # Namespaces, macros, templates
+  - key:             readability-identifier-naming.NamespaceCase
+    value:           lower_case
+  - key:             readability-identifier-naming.MacroDefinitionCase
+    value:           UPPER_CASE
+  - key:             readability-identifier-naming.TemplateParameterCase
+    value:           CamelCase
+
+SystemHeaders: false
+...

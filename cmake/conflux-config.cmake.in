@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+# Un-comment the following lines if your library depends on system threads
+# (which is very likely for a lock-free library)
+# include(CMakeFindDependencyMacro)
+# find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/confluxTargets.cmake")
+
+check_required_components(conflux)
