@@ -5,7 +5,7 @@
 #include <cstring>
 #include <gsl-lite/gsl-lite.hpp>
 #include <memory>
-#include <optional>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -77,55 +77,12 @@ IdAllocator &domain_id_allocator() noexcept
   return allocator;
 }
 
-// Helper to pop an element from a lock-free singly-linked list stored in an atomic pointer.
-template <typename T, typename NextFn>
-[[nodiscard]] std::optional<T *> acquire(std::atomic<T *> &list_head, NextFn next) noexcept
-{
-  for (;;)
-  {
-    T *old_head = list_head.load(std::memory_order_acquire);
-    if (!old_head)
-      break;
-
-    T *next_ptr = next(old_head);
-    if (list_head.compare_exchange_weak(old_head, next_ptr, std::memory_order_acq_rel, std::memory_order_relaxed))
-      return old_head;
-
-    cpu_relax();
-  }
-
-  return std::nullopt;
-}
-
-template <typename T, typename SNextFn>
-void release(std::atomic<T *> &list_head, T *new_head, SNextFn set_next) noexcept
-{
-  for (;;)
-  {
-    T *old_head = list_head.load(std::memory_order_acquire);
-    set_next(new_head, old_head);
-    if (list_head.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed))
-      break;
-    cpu_relax();
-  }
-}
-
 } // namespace
 
 namespace detail
 {
 
-void DomainState::release_ref() noexcept
-{
-  if (ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1)
-  {
-    const auto recycled_id = id_.load(std::memory_order_relaxed);
-    delete this; // NOLINT(cppcoreguidelines-owning-memory)
-    domain_id_allocator().deallocate(recycled_id);
-  }
-}
-
-DomainState::ThreadRecord::ThreadRecord()
+ThreadRecord::ThreadRecord()
     : retired_lists_{}, retired_sizes_{}, epoch_{IDLE_EPOCH}, next_available_{nullptr}, next_{nullptr}, active_{false}
 {
   retired_sizes_.fill(0);
@@ -137,21 +94,18 @@ DomainState::ThreadRecord::ThreadRecord()
 
 DomainState::DomainState()
     : id_{domain_id_allocator().allocate()}, ref_count_{0}, epoch_{0}, retired_count_{0}, deleted_count_{0},
-      active_thread_records_{nullptr}, inactive_thread_records_{nullptr}, recycled_segments_{nullptr}, retired_lists_{},
-      active_threads_{0}
+      thread_records_{}, inactive_thread_records_{}, recycled_segments_{}, limbo_bags_{}, active_threads_{0}
 {
   auto first_rec = std::make_unique<ThreadRecord>();
   ThreadRecord *first_rec_raw = first_rec.release();
 
-  release(active_thread_records_, first_rec_raw,
-          [](ThreadRecord *new_rec, ThreadRecord *old_rec) { new_rec->next_ = old_rec; });
+  thread_records_.push(first_rec_raw);
 
-  release(inactive_thread_records_, first_rec_raw,
-          [](ThreadRecord *new_rec, ThreadRecord *old_rec) { new_rec->next_available_ = old_rec; });
+  inactive_thread_records_.push(first_rec_raw);
 
-  for (auto &bag : retired_lists_)
+  for (auto &bag : limbo_bags_)
   {
-    gsl::owner<Segment *> segment = acquire_segment();
+    gsl::owner<LimboBag::Segment *> segment = acquire_segment();
     bag.head_seg_.store(segment, std::memory_order_relaxed);
     bag.tail_seg_.store(segment, std::memory_order_relaxed);
   }
@@ -164,24 +118,21 @@ void DomainState::enter(ThreadRecord *rec)
   rec->epoch_.store(current_epoch, std::memory_order_release);
 }
 
-DomainState::ThreadRecord *DomainState::acquire_record()
+ThreadRecord *DomainState::acquire_record()
 {
-  auto opt = acquire(inactive_thread_records_,
-                     [](ThreadRecord *old_rec) { return old_rec->next_available_.load(std::memory_order_relaxed); });
-  if (opt.has_value())
+  auto *reused = inactive_thread_records_.pop();
+  if (reused)
   {
-    ThreadRecord *reused = opt.value();
     reused->active_.store(true, std::memory_order_release);
-    reused->epoch_.store(IDLE_EPOCH, std::memory_order_release);
     active_threads_.fetch_add(1, std::memory_order_relaxed);
     return reused;
   }
 
   auto rec_owner = std::make_unique<ThreadRecord>();
   ThreadRecord *rec = rec_owner.release();
-  rec->active_.store(true, std::memory_order_release);
+  rec->active_.store(true, std::memory_order_relaxed);
+  thread_records_.push(rec);
   active_threads_.fetch_add(1, std::memory_order_relaxed);
-  release(active_thread_records_, rec, [](ThreadRecord *new_rec, ThreadRecord *old_rec) { new_rec->next_ = old_rec; });
 
   return rec;
 }
@@ -244,7 +195,7 @@ void DomainState::retire_without_reclaim(Retireable *object, void (*deleter)(Ret
     {
       for (std::size_t defer_idx = 0; defer_idx < retired_size; ++defer_idx)
       {
-        enqueue(bin_idx, retired_list[defer_idx]);
+        enqueue(limbo_bags_[bin_idx], retired_list[defer_idx]);
       }
       retired_size = 0;
     }
@@ -279,7 +230,7 @@ void DomainState::try_reclaim()
   auto current_epoch = epoch_.load(std::memory_order_acquire);
 
   // Attempt to advance the epoch if no thread is lagging behind.
-  const ThreadRecord *rec = active_thread_records_.load(std::memory_order_acquire);
+  const ThreadRecord *rec = thread_records_.get_head();
   bool can_advance = true;
   while (rec != nullptr)
   {
@@ -289,7 +240,7 @@ void DomainState::try_reclaim()
       can_advance = false;
       break;
     }
-    rec = rec->next_.load(std::memory_order_relaxed);
+    rec = rec->next_;
   }
 
   if (can_advance)
@@ -303,19 +254,19 @@ void DomainState::try_reclaim()
   const std::size_t reclaim_idx = (current_epoch + 1) % MAX_BINS;
   for (;;)
   {
-    auto maybe_retired = dequeue(
-        reclaim_idx,
-        [](Segment *seg, void *ctx) {
+    auto *maybe_retired = dequeue(
+        limbo_bags_[reclaim_idx],
+        [](LimboBag::Segment *segment, void *ctx) {
           auto *domain = static_cast<DomainState *>(ctx);
-          domain->retire_without_reclaim(seg, &DomainState::recycle_segment);
+          domain->retire_without_reclaim(reinterpret_cast<Retireable *>(segment), &DomainState::LimboBag::recycle_segment);
         },
         this);
-    if (!maybe_retired.has_value())
+    if (maybe_retired == nullptr)
     {
       break;
     }
 
-    Retireable *retired = maybe_retired.value();
+    Retireable *retired = maybe_retired;
     if ((retired->epoch + 1) < current_epoch)
     {
       retired->deleter(retired);
@@ -325,7 +276,7 @@ void DomainState::try_reclaim()
     {
       // FIFO queue: the first too-young element means the rest are also too young.
       retired->epoch = current_epoch;
-      enqueue(current_epoch % MAX_BINS, retired);
+      enqueue(limbo_bags_[current_epoch % MAX_BINS], retired);
       break;
     }
   }
@@ -335,15 +286,14 @@ void DomainState::release_record(ThreadRecord *rec) noexcept
 {
   rec->epoch_.store(IDLE_EPOCH, std::memory_order_release);
   rec->active_.store(false, std::memory_order_release);
-  active_threads_.fetch_sub(1, std::memory_order_relaxed);
 
-  release(inactive_thread_records_, rec,
-          [](ThreadRecord *new_rec, ThreadRecord *old_rec) { new_rec->next_available_ = old_rec; });
+  inactive_thread_records_.push(rec);
+
+  active_threads_.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void DomainState::enqueue(std::size_t bin_idx, Retireable *item)
+void DomainState::enqueue(LimboBag &bag, Retireable *item)
 {
-  LimboBag &bag = retired_lists_[bin_idx];
   for (;;)
   {
     auto *tail_seg = bag.tail_seg_.load(std::memory_order_acquire);
@@ -355,7 +305,7 @@ void DomainState::enqueue(std::size_t bin_idx, Retireable *item)
     const bool success = new_seg->enqueue(item);
     assert(success && "private enqueue() must always succeed");
 
-    QueueBase *next = nullptr;
+    LimboBag::Segment *next = nullptr;
     if (tail_seg->next_.compare_exchange_strong(next, new_seg, std::memory_order_acq_rel, std::memory_order_acquire))
     {
       (void)bag.tail_seg_.compare_exchange_strong(tail_seg, new_seg, std::memory_order_acq_rel,
@@ -364,32 +314,28 @@ void DomainState::enqueue(std::size_t bin_idx, Retireable *item)
     }
 
     // Safe because segments in the ring buffer are always DomainState::Segment instances.
-    auto *const next_seg = static_cast<Segment *>(next); // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+    auto *const next_seg =
+        static_cast<LimboBag::Segment *>(next); // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     (void)bag.tail_seg_.compare_exchange_strong(tail_seg, next_seg, std::memory_order_acq_rel,
                                                 std::memory_order_relaxed);
     release_segment(new_seg);
   }
 }
 
-DomainState::Segment *DomainState::acquire_segment()
+DomainState::LimboBag::Segment *DomainState::acquire_segment()
 {
-  auto opt = acquire(recycled_segments_, [](Segment *seg) {
-    return static_cast<Segment *>(seg->next_available_.load(std::memory_order_relaxed)); // NOLINT
-  });
-  if (opt.has_value())
+  auto *reused = recycled_segments_.pop();
+  if (reused)
   {
-    Segment *segment = opt.value();
-    segment->owner_ = this;
-    segment->reset();
+    new (reused) LimboBag::Segment(std::launder(this));
 #if defined(CONFLUX_EBR_DEBUG)
-    segment->retired_flag.store(false, std::memory_order_relaxed);
+    reused->retired_flag.store(false, std::memory_order_relaxed);
 #endif
-    return segment;
+    return reused;
   }
 
-  auto segment_owner = std::make_unique<Segment>(this);
-  Segment *segment_raw = segment_owner.release();
-  segment_raw->reset();
+  auto segment_owner = std::make_unique<LimboBag::Segment>(this);
+  LimboBag::Segment *segment_raw = segment_owner.release();
 #if defined(CONFLUX_EBR_DEBUG)
   segment_raw->retired_flag.store(false, std::memory_order_relaxed);
 #endif
@@ -397,16 +343,16 @@ DomainState::Segment *DomainState::acquire_segment()
   return segment_raw;
 }
 
-void DomainState::release_segment(DomainState::Segment *s) noexcept
+void DomainState::release_segment(DomainState::LimboBag::Segment *s) noexcept
 {
   s->owner_ = this;
-  s->reset();
-  release(recycled_segments_, s, [](Segment *new_seg, Segment *old_seg) { new_seg->next_available_ = old_seg; });
+  recycled_segments_.push(s);
 }
 
-void DomainState::recycle_segment(Retireable *retired) noexcept
+void DomainState::LimboBag::recycle_segment(Retireable *retired) noexcept
 {
-  auto *segment = static_cast<Segment *>(retired); // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  auto *segment =
+      reinterpret_cast<LimboBag::Segment *>(retired); // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   if (segment->owner_ != nullptr)
   {
     segment->owner_->release_segment(segment);
@@ -417,28 +363,26 @@ void DomainState::recycle_segment(Retireable *retired) noexcept
   delete segment; // NOLINT(cppcoreguidelines-owning-memory)
 }
 
-std::optional<Retireable *> DomainState::dequeue(std::size_t bin_idx, OnSwing on_swing, void *ctx)
+Retireable *DomainState::dequeue(DomainState::LimboBag &bag, OnSwing on_swing, void *ctx)
 {
-  LimboBag &bag = retired_lists_[bin_idx];
-
   for (;;)
   {
 
     auto *head_seg = bag.head_seg_.load(std::memory_order_acquire);
 
-    auto res = head_seg->dequeue();
-    if (res.has_value())
+    auto *res = head_seg->dequeue();
+    if (res != nullptr)
       return res;
 
-    QueueBase *next_base = head_seg->next_.load(std::memory_order_acquire);
+    LimboBag::Segment *next_base = head_seg->next_.load(std::memory_order_acquire);
     if (next_base == nullptr)
-      return std::nullopt;
+      return nullptr;
 
     res = head_seg->dequeue();
-    if (res.has_value())
+    if (res != nullptr)
       return res;
 
-    auto *next = static_cast<Segment *>(next_base); // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+    auto *next = static_cast<LimboBag::Segment *>(next_base); // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     if (bag.head_seg_.compare_exchange_strong(head_seg, next, std::memory_order_acq_rel, std::memory_order_relaxed))
     {
       on_swing(head_seg, ctx);
@@ -446,51 +390,64 @@ std::optional<Retireable *> DomainState::dequeue(std::size_t bin_idx, OnSwing on
   }
 }
 
+void DomainState::release_ref() noexcept
+{
+  if (ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+  {
+    const auto recycled_id = id_.load(std::memory_order_relaxed);
+    delete this; // NOLINT(cppcoreguidelines-owning-memory)
+    domain_id_allocator().deallocate(recycled_id);
+  }
+}
+
 DomainState::~DomainState() noexcept
 {
   // Drain all limbo bags without calling back into retire/try_reclaim paths.
-  for (auto &bag : retired_lists_)
+  for (auto &bag : limbo_bags_)
   {
-    auto delete_on_swing = [](Segment *seg, void *) { delete seg; }; // NOLINT(cppcoreguidelines-owning-memory)
+    auto delete_on_swing = [](LimboBag::Segment *seg, void *) {
+      delete seg;
+    }; // NOLINT(cppcoreguidelines-owning-memory)
     for (;;)
     {
-      auto retired = dequeue(static_cast<std::size_t>(&bag - retired_lists_.data()), delete_on_swing, nullptr);
-      if (!retired.has_value())
+      auto *retired = dequeue(bag, delete_on_swing, nullptr);
+      if (retired == nullptr)
       {
         break;
       }
-      retired.value()->deleter(retired.value());
+      retired->deleter(retired);
     }
 
-    gsl::owner<Segment *> seg = bag.head_seg_.load(std::memory_order_relaxed);
+    gsl::owner<LimboBag::Segment *> seg = bag.head_seg_.load(std::memory_order_relaxed);
     while (seg != nullptr)
     {
-      gsl::owner<Segment *> next = static_cast<Segment *>(seg->next_.load(std::memory_order_relaxed)); // NOLINT
+      gsl::owner<LimboBag::Segment *> next =
+          static_cast<LimboBag::Segment *>(seg->next_.load(std::memory_order_relaxed)); // NOLINT
       delete seg; // NOLINT(cppcoreguidelines-owning-memory)
       seg = next;
     }
   }
 
-  gsl::owner<Segment *> recycled = recycled_segments_.load(std::memory_order_acquire);
+  gsl::owner<LimboBag::Segment *> recycled = recycled_segments_.get_head();
   while (recycled != nullptr)
   {
-    gsl::owner<Segment *> next =
-        static_cast<Segment *>(recycled->next_available_.load(std::memory_order_relaxed)); // NOLINT
+    gsl::owner<LimboBag::Segment *> next =
+        static_cast<LimboBag::Segment *>(recycled->next_available_); // NOLINT
     delete recycled; // NOLINT(cppcoreguidelines-owning-memory)
     recycled = next;
   }
 
-  gsl::owner<ThreadRecord *> head = active_thread_records_.load(std::memory_order_acquire);
+  gsl::owner<ThreadRecord *> head = thread_records_.get_head();
   while (head != nullptr)
   {
-    gsl::owner<ThreadRecord *> next = head->next_.load(std::memory_order_relaxed);
+    gsl::owner<ThreadRecord *> next = head->next_;
     delete head; // NOLINT(cppcoreguidelines-owning-memory)
 
     head = next;
   }
 }
 
-DomainState::ThreadRecord *ThreadLocalState::get_cached_rec(std::uint64_t id)
+ThreadRecord *ThreadLocalState::get_cached_rec(std::uint64_t id)
 {
   if (domains_.size() <= id)
   {
@@ -500,7 +457,7 @@ DomainState::ThreadRecord *ThreadLocalState::get_cached_rec(std::uint64_t id)
   return domains_[id].rec_;
 }
 
-DomainState::ThreadRecord *ThreadLocalState::get_cached_rec_no_allocate(std::uint64_t id) noexcept
+ThreadRecord *ThreadLocalState::get_cached_rec_no_allocate(std::uint64_t id) noexcept
 {
   if (domains_.size() <= id)
   {
@@ -510,7 +467,8 @@ DomainState::ThreadRecord *ThreadLocalState::get_cached_rec_no_allocate(std::uin
   return domains_[id].rec_;
 }
 
-void ThreadLocalState::set_cached_state(std::uint64_t id, ::conflux::ebr::Domain state, DomainState::ThreadRecord *rec) noexcept
+void ThreadLocalState::set_cached_state(std::uint64_t id, ::conflux::ebr::Domain state,
+                                        ThreadRecord *rec) noexcept
 {
   assert(domains_.size() > id && "this thread has never been a part of domain.");
 
@@ -540,7 +498,7 @@ void ThreadLocalState::clear_cached_state(std::uint64_t id) noexcept
         auto &retired_list = rec->retired_lists_[bin_idx];
         for (std::size_t j = 0; j < retired_size; ++j)
         {
-          state.state_->enqueue(bin_idx, retired_list[j]);
+          state.state_->enqueue(state.state_->limbo_bags_[bin_idx], retired_list[j]);
         }
         retired_size = 0;
       }
@@ -576,7 +534,7 @@ ThreadLocalState::~ThreadLocalState()
         auto &retired_list = rec->retired_lists_[bin_idx];
         for (std::size_t j = 0; j < retired_size; ++j)
         {
-          state.state_->enqueue(bin_idx, retired_list[j]);
+          state.state_->enqueue(state.state_->limbo_bags_[bin_idx], retired_list[j]);
         }
         retired_size = 0;
       }

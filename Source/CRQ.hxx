@@ -14,9 +14,8 @@
 #include <optional>
 
 #include "Common.hxx"
-#include "Conflux/Memory.hxx"
 
-namespace conflux::ebr::detail
+namespace conflux
 {
 
 /**
@@ -25,7 +24,7 @@ namespace conflux::ebr::detail
  * @tparam T element type stored in each cell (must satisfy Retireable).
  * @tparam PowerTwo log2 of the number of cells in the queue.
  */
-template <typename T, size_t PowerTwo> class CRQ : public Retireable
+template <typename T, size_t PowerTwo> class CRQ
 {
 
   static constexpr std::uint64_t ZERO_BITS = std::countr_zero(alignof(T));
@@ -86,7 +85,7 @@ public:
   /**
    * @brief Construct an empty queue and initialize all cells as safe and empty.
    */
-  CRQ() : head_{NUM_CELLS}, tail_{NUM_CELLS}, next_{nullptr}, closed_{false}
+  CRQ() : head_{NUM_CELLS}, tail_{NUM_CELLS}, closed_{false}
   {
     constexpr std::uint64_t sne = 1ULL << 63;
     for (auto &cell : cells_)
@@ -156,7 +155,7 @@ public:
    *
    * @return std::optional containing the dequeued pointer, or std::nullopt if empty.
    */
-  std::optional<T *> dequeue() noexcept
+  T * dequeue() noexcept
   {
     for (;;)
     {
@@ -221,41 +220,17 @@ public:
       }
       const std::uint64_t t = tail_.load(std::memory_order_acquire);
       if (t <= h + 1)
-        return std::nullopt;
+        return nullptr;
     }
   }
 
-  /**
-   * @brief Reset the queue to an empty state for reuse.
-   */
-  void reset() noexcept
-  {
-    constexpr std::uint64_t sne = 1ULL << 63;
-    for (auto &cell : cells_)
-    {
-      cell.safe_and_epoch_.store(sne, std::memory_order_relaxed);
-      cell.value_.store(NIL, std::memory_order_relaxed);
-    }
-
-    next_.store(nullptr, std::memory_order_relaxed);
-    next_available_.store(nullptr, std::memory_order_relaxed);
-    head_.store(NUM_CELLS, std::memory_order_relaxed);
-    tail_.store(NUM_CELLS, std::memory_order_relaxed);
-    closed_.store(false, std::memory_order_relaxed);
-  }
-
-  /// Next segment in the linked list of segments owned by a domain.
-  alignas(hardware_destructive_interference_size) std::atomic<CRQ *> next_;
-  /// Lazily published pointer used during segment recycling.
-  alignas(hardware_destructive_interference_size) std::atomic<CRQ *> next_available_;
-
-protected:
+private:
   std::array<Cell, NUM_CELLS> cells_;
   alignas(hardware_destructive_interference_size) std::atomic<std::uint64_t> head_;
   alignas(hardware_destructive_interference_size) std::atomic<std::uint64_t> tail_;
   alignas(hardware_destructive_interference_size) std::atomic<bool> closed_;
 };
 
-} // namespace conflux::ebr::detail
+} // namespace conflux
 
 #endif

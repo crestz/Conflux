@@ -2,9 +2,9 @@ find_package(gsl-lite CONFIG REQUIRED)
 
 add_library(${PROJECT_NAME}
   "Common.hxx"
+  "CRQ.hxx"
   "memory/EBR.hxx"
   "memory/EBR.cxx"
-  "memory/detail/CRQ.hxx"
 )
 
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
