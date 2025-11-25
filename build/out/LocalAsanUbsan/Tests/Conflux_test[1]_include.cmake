@@ -1,5 +1,0 @@
-if(EXISTS "/Users/prakharprabir/source/orgs/crestz/conflux/build/out/LocalAsanUbsan/Tests/Conflux_test[1]_tests.cmake")
-  include("/Users/prakharprabir/source/orgs/crestz/conflux/build/out/LocalAsanUbsan/Tests/Conflux_test[1]_tests.cmake")
-else()
-  add_test(Conflux_test_NOT_BUILT Conflux_test_NOT_BUILT)
-endif()
